@@ -104,7 +104,13 @@ class OwnerRezClient:
                 "(unset OWNERREZ_READ_ONLY to allow writes)."
             )
 
-        url = path if path.startswith("http") else f"{self.base_url}/{path.lstrip('/')}"
+        if path.startswith("http"):
+            url = path
+        else:
+            clean_path = path.lstrip("/")
+            if clean_path.startswith("v2/"):
+                clean_path = clean_path[3:]
+            url = f"{self.base_url}/{clean_path}"
         clean_params = (
             {k: v for k, v in params.items() if v is not None} if params else None
         )
