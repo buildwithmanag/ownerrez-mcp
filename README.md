@@ -50,25 +50,26 @@ Prefer to run from source? See [Install from source](#install-from-source).
 
 | Tool | Purpose | Endpoint |
 |------|---------|----------|
-| `list_bookings` | Current & upcoming bookings by date / property | `GET /v2/bookings` ✅ |
+| `list_bookings` | Bookings changed since a time; filter by status / property / arrival window | `GET /v2/bookings` ✅ |
 | `get_booking` | Full detail for one booking | `GET /v2/bookings/{id}` ✅ |
 | `who_is_staying` | Who's checked in right now, per property | derived ✅ |
 | `list_properties` / `list_owners` / `find_guest` | Reference lookups | `GET` ✅ |
 | `list_quotes` / `list_payments` / `list_refunds` / `list_fees` | Financial reads | `GET` ✅ |
-| `find_open_messages` | Recent / open guest message threads | `GET /v2/threads` ⚠️ |
-| `list_messages` | Messages within a thread | `GET /v2/messages` ✅ |
+| `list_messages` | Messages in a thread (by `threadId`) | `GET /v2/messages` ✅ |
 | `send_message` | Reply to a guest *(write)* | `POST /v2/messages` ✅ |
-| `add_expense_for_booking` / `_property` / `_owner` | Record an expense *(write)* | `POST /v2/expenses` ⚠️ |
 | `list_webhook_subscriptions` | List webhooks | `GET` ✅ |
 | `create_webhook_subscription` / `delete_webhook_subscription` | Manage webhooks *(write)* | `POST`/`DELETE` ✅ |
+| `list_open_messages` / `get_message_event` / `mark_message_handled` | Inbound-message inbox, fed by the webhook receiver | local store ✅ |
 
 **Resources:** `ownerrez://properties`, `ownerrez://owners`
 **Prompts:** `draft_checkin_message`, `draft_guest_reply`
 
-⚠️ Two endpoints aren't fully documented publicly — **expense creation** and
-**message-thread listing**. Run the [probe](#verify-against-the-live-api) to
-confirm what your account supports; the tools degrade gracefully with a clear
-message if an endpoint isn't available.
+> **Verified against the live API — two OwnerRez limitations to know:**
+> there is **no public expense-creation endpoint**, and **no endpoint that lists
+> message threads**. Inbound guest messages arrive via **webhooks** — subscribe
+> to the `message` category with `create_webhook_subscription`, then use the
+> event's `threadId` with `list_messages` / `send_message`. Bookings and guests
+> are bounded by a "since" time, not by stay dates.
 
 ### Example prompts
 
@@ -76,8 +77,7 @@ message if an endpoint isn't available.
 - "Who's currently staying at the Beach House?"
 - "Draft a check-in message for the guest arriving tomorrow at Cabin 3."
 - "Show me all payments on booking 84213."
-- "Add a $120 cleaning expense to booking 84213."
-- "Any guest messages I haven't replied to?"
+- "List the messages on thread 55123 and draft a reply."
 
 ## Authentication
 
@@ -95,6 +95,36 @@ ownerrez-mcp auth
 
 It opens the authorize page, captures the redirect locally, and prints the
 `OWNERREZ_ACCESS_TOKEN` to save.
+
+## Real inbound messages (webhook receiver)
+
+OwnerRez has no endpoint to poll for open conversations — inbound guest messages
+are delivered by **webhooks**. This package ships a small receiver that captures
+them into a local store so `list_open_messages` becomes a real inbox.
+
+```bash
+# 1. Install the optional extra and run the receiver
+pip install "ownerrez-mcp[webhook]"
+ownerrez-mcp webhook                      # listens on 0.0.0.0:8000
+
+# 2. Expose it on a public HTTPS URL (any tunnel works), e.g.
+#    ngrok http 8000   ->   https://<something>.ngrok.app
+```
+
+Then register that URL (via the MCP tool or any client):
+
+```text
+create_webhook_subscription(url="https://<something>.ngrok.app/", category="message")
+```
+
+Now incoming guest messages land in the store, and in your agent you can ask
+*"show my open messages"* (`list_open_messages`), reply with `send_message` using
+the message's `thread_id`, and `mark_message_handled` to clear it.
+
+Config: `OWNERREZ_STORE` (db path, default `~/.ownerrez-mcp/messages.db`),
+`OWNERREZ_WEBHOOK_HOST` / `OWNERREZ_WEBHOOK_PORT`, and an optional
+`OWNERREZ_WEBHOOK_SECRET` (sent as `X-Webhook-Secret` or `?secret=`) to reject
+unauthenticated posts. Always run behind HTTPS.
 
 ## Safety: read-only mode
 

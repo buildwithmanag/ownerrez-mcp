@@ -61,7 +61,8 @@ def test_send_message_success(monkeypatch):
     use_fake(monkeypatch, calls=calls)
     result = server.send_message(thread_id=42, body="Hello!")
     assert result["ok"] is True
-    assert calls == [("POST", "/messages", {"thread_id": 42, "body": "Hello!"})]
+    # OwnerRez uses camelCase threadId in the message payload.
+    assert calls == [("POST", "/messages", {"threadId": 42, "body": "Hello!"})]
 
 
 def test_send_message_blocked_in_read_only(monkeypatch):
@@ -73,10 +74,10 @@ def test_send_message_blocked_in_read_only(monkeypatch):
     assert calls == []  # never hit the API
 
 
-def test_expense_blocked_in_read_only(monkeypatch):
+def test_create_webhook_blocked_in_read_only(monkeypatch):
     calls = []
     use_fake(monkeypatch, calls=calls, read_only=True)
-    result = server.add_expense_for_booking(booking_id=1, amount=50.0, description="Cleaning")
+    result = server.create_webhook_subscription(url="https://x.example/hook", category="message")
     assert result["ok"] is False
     assert result["read_only"] is True
     assert calls == []

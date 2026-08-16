@@ -1,13 +1,21 @@
 """OwnerRez MCP server.
 
 Exposes OwnerRez v2 API operations as MCP tools, resources, and prompts:
-bookings, in-house guests, guest messaging, expenses, webhooks, and read-only
-financial lookups (quotes, payments, refunds, fees).
+bookings, in-house guests, guest messaging, webhooks, and read-only financial
+lookups (quotes, payments, refunds, fees).
 
 Credentials & options come from the environment (see .env.example):
     OWNERREZ_ACCESS_TOKEN                 # OAuth access token (preferred)
     OWNERREZ_USERNAME + OWNERREZ_TOKEN    # Personal Access Token fallback
     OWNERREZ_READ_ONLY=1                  # block all write tools
+
+Notes on the OwnerRez v2 API (verified live):
+  * GET /v2/bookings is bounded by ``since_utc`` (changed-since), plus optional
+    ``status`` and ``property_ids`` — it has no arrival date-range filter.
+  * GET /v2/guests is bounded by ``created_since_utc``.
+  * Messaging uses ``threadId``. There is no endpoint that lists all threads;
+    inbound guest messages are delivered via webhooks.
+  * OwnerRez does not expose a public expense-creation endpoint.
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ from fastmcp import FastMCP
 
 from .client import OwnerRezClient, OwnerRezError, ReadOnlyError
 from .config import Settings
+from .store import MessageStore
 
 try:  # optional: load a local .env if python-dotenv is present
     from dotenv import load_dotenv
@@ -32,15 +41,17 @@ SETTINGS = Settings.from_env()
 mcp = FastMCP(
     name="OwnerRez",
     instructions=(
-        "Tools for managing an OwnerRez vacation-rental account: list current "
-        "bookings, see who is staying now, message guests, find open message "
-        "threads, record expenses, manage webhooks, and read financials. "
-        "Dates are YYYY-MM-DD; IDs are OwnerRez numeric IDs. When the server is "
-        "in read-only mode, write tools return an error instead of acting."
+        "Tools for managing an OwnerRez vacation-rental account: list bookings, "
+        "see who is staying now, read financials, message guests, and manage "
+        "webhooks. Dates are YYYY-MM-DD; timestamps are UTC ISO-8601; IDs are "
+        "OwnerRez numeric IDs. Booking/guest lists are bounded by a 'since' time, "
+        "not by stay dates. When the server is in read-only mode, write tools "
+        "return an error instead of acting."
     ),
 )
 
 _client: Optional[OwnerRezClient] = None
+_store: Optional[MessageStore] = None
 
 
 def client() -> OwnerRezClient:
@@ -50,8 +61,19 @@ def client() -> OwnerRezClient:
     return _client
 
 
+def store() -> MessageStore:
+    global _store
+    if _store is None:
+        _store = MessageStore(SETTINGS.store_path)
+    return _store
+
+
 def _today() -> str:
     return _dt.date.today().isoformat()
+
+
+def _utc_days_ago(days: int) -> str:
+    return (_dt.datetime.utcnow() - _dt.timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _err(exc: Exception) -> Dict[str, Any]:
@@ -85,34 +107,56 @@ def _guard_write(action: str) -> Optional[Dict[str, Any]]:
 
 @mcp.tool
 def list_bookings(
-    from_date: Optional[str] = None,
-    to_date: Optional[str] = None,
+    since_utc: Optional[str] = None,
+    status: Optional[str] = "active",
     property_ids: Optional[str] = None,
+    arrival_start: Optional[str] = None,
+    arrival_end: Optional[str] = None,
     include_guest: bool = True,
     include_charges: bool = False,
     max_items: int = 200,
 ) -> Dict[str, Any]:
-    """List current and upcoming bookings.
+    """List bookings.
+
+    OwnerRez bounds this endpoint by ``since_utc`` (bookings created or changed
+    since a UTC time), not by stay dates — so a time bound is always sent. Use
+    ``arrival_start`` / ``arrival_end`` to narrow to a stay window client-side.
 
     Args:
-        from_date: Start of the stay window (YYYY-MM-DD). Defaults to today.
-        to_date: End of the window (YYYY-MM-DD). Defaults to one year out.
+        since_utc: Only bookings changed on/after this UTC time (ISO-8601, e.g.
+            2026-01-01T00:00:00Z). Defaults to 180 days ago.
+        status: Booking status filter: "active", "canceled", or "pending".
+            Defaults to "active"; pass null for all statuses.
         property_ids: Optional comma-separated property IDs to filter by.
+        arrival_start: Keep only bookings arriving on/after this date (YYYY-MM-DD).
+        arrival_end: Keep only bookings arriving on/before this date (YYYY-MM-DD).
         include_guest: Include guest contact details on each booking.
         include_charges: Include the financial charge breakdown.
         max_items: Safety cap on results.
     """
-    from_date = from_date or _today()
-    to_date = to_date or (_dt.date.today() + _dt.timedelta(days=365)).isoformat()
+    if since_utc is None:
+        since_utc = _utc_days_ago(180)
     params = {
-        "from": from_date,
-        "to": to_date,
+        "since_utc": since_utc,
+        "status": status,
         "property_ids": property_ids,
         "include_guest": str(include_guest).lower(),
         "include_charges": str(include_charges).lower(),
     }
     try:
         bookings = client().get_all("/bookings", params=params, max_items=max_items)
+        if arrival_start or arrival_end:
+            def _keep(b: Dict[str, Any]) -> bool:
+                a = str(b.get("arrival", ""))[:10]
+                if not a:
+                    return False
+                if arrival_start and a < arrival_start:
+                    return False
+                if arrival_end and a > arrival_end:
+                    return False
+                return True
+
+            bookings = [b for b in bookings if _keep(b)]
         return {"ok": True, "count": len(bookings), "bookings": bookings}
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
@@ -133,7 +177,8 @@ def who_is_staying(on_date: Optional[str] = None) -> Dict[str, Any]:
     """Show who is currently staying in each property (in-house guests).
 
     Returns one row per active stay (arrival <= on_date < departure) with
-    property, guest name, and dates. Defaults to today.
+    property, guest name, and dates. Defaults to today. Internally pulls active
+    bookings changed in the last ~year and filters by stay date.
     """
     on_date = on_date or _today()
     try:
@@ -142,8 +187,8 @@ def who_is_staying(on_date: Optional[str] = None) -> Dict[str, Any]:
 
         bookings = client().get_all(
             "/bookings",
-            params={"from": on_date, "to": on_date, "include_guest": "true"},
-            max_items=500,
+            params={"since_utc": _utc_days_ago(365), "status": "active", "include_guest": "true"},
+            max_items=1000,
         )
         staying: List[Dict[str, Any]] = []
         for b in bookings:
@@ -199,10 +244,25 @@ def list_owners(max_items: int = 500) -> Dict[str, Any]:
 
 
 @mcp.tool
-def find_guest(query: Optional[str] = None, max_items: int = 100) -> Dict[str, Any]:
-    """Search guests by name/email. Omit query to list recent guests."""
+def find_guest(
+    query: Optional[str] = None,
+    created_since_utc: Optional[str] = None,
+    max_items: int = 100,
+) -> Dict[str, Any]:
+    """Search or list guests.
+
+    OwnerRez bounds this endpoint by ``created_since_utc``.
+
+    Args:
+        query: Optional name/email search term.
+        created_since_utc: Only guests created on/after this UTC time (ISO-8601).
+            Defaults to 2015-01-01.
+        max_items: Safety cap on results.
+    """
+    params: Dict[str, Any] = {"created_since_utc": created_since_utc or "2015-01-01T00:00:00Z"}
+    if query:
+        params["q"] = query
     try:
-        params = {"q": query} if query else None
         guests = client().get_all("/guests", params=params, max_items=max_items)
         return {"ok": True, "count": len(guests), "guests": guests}
     except Exception as exc:  # noqa: BLE001
@@ -256,36 +316,36 @@ def list_fees(booking_id: Optional[int] = None, max_items: int = 100) -> Dict[st
 
 
 # ==================================================================== Messaging
+# OwnerRez identifies conversations by threadId. There is no endpoint that lists
+# all threads — inbound guest messages are delivered via webhooks (subscribe
+# with create_webhook_subscription), which is how you discover a threadId.
 
 @mcp.tool
-def find_open_messages(
+def list_messages(
+    thread_id: int,
+    include_drafts: bool = False,
+    include_attachments: bool = True,
     since_utc: Optional[str] = None,
-    unread_only: bool = True,
     max_items: int = 100,
 ) -> Dict[str, Any]:
-    """Find open / recent guest message threads that may need a reply.
+    """List the messages in a conversation thread.
 
-    Defaults to threads updated in the last 14 days. NOTE: the exact thread
-    listing endpoint is confirmed by the probe (`ownerrez-mcp probe`).
+    Args:
+        thread_id: The OwnerRez conversation/thread ID (``threadId``).
+        include_drafts: Include unsent draft messages.
+        include_attachments: Include attachment URLs.
+        since_utc: Only messages on/after this UTC time (ISO-8601).
+        max_items: Safety cap on results.
     """
-    if since_utc is None:
-        since = _dt.datetime.utcnow() - _dt.timedelta(days=14)
-        since_utc = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+    params: Dict[str, Any] = {
+        "threadId": thread_id,
+        "include_drafts": str(include_drafts).lower(),
+        "include_attachments": str(include_attachments).lower(),
+    }
+    if since_utc:
+        params["since_utc"] = since_utc
     try:
-        threads = client().get_all("/threads", params={"since_utc": since_utc}, max_items=max_items)
-        if unread_only:
-            flagged = [t for t in threads if t.get("is_unread") or t.get("has_unread") or t.get("is_open")]
-            threads = flagged if flagged else threads
-        return {"ok": True, "count": len(threads), "threads": threads}
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
-@mcp.tool
-def list_messages(thread_id: int, max_items: int = 100) -> Dict[str, Any]:
-    """List the messages within a single conversation thread."""
-    try:
-        rows = client().get_all("/messages", params={"thread_id": thread_id}, max_items=max_items)
+        rows = client().get_all("/messages", params=params, max_items=max_items)
         return {"ok": True, "thread_id": thread_id, "count": len(rows), "messages": rows}
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
@@ -296,7 +356,8 @@ def send_message(thread_id: int, body: str, attachment_url: Optional[str] = None
     """Send a message to a guest on an existing conversation thread.
 
     Args:
-        thread_id: The OwnerRez message thread / conversation ID.
+        thread_id: The OwnerRez conversation/thread ID (``threadId``). You learn
+            this from a booking's conversation or a "message" webhook event.
         body: The message text to send.
         attachment_url: Optional URL to a single image attachment (max ~5MB).
 
@@ -305,7 +366,7 @@ def send_message(thread_id: int, body: str, attachment_url: Optional[str] = None
     blocked = _guard_write("send a message")
     if blocked:
         return blocked
-    payload: Dict[str, Any] = {"thread_id": thread_id, "body": body}
+    payload: Dict[str, Any] = {"threadId": thread_id, "body": body}
     if attachment_url:
         payload["attachment_url"] = attachment_url
     try:
@@ -314,99 +375,9 @@ def send_message(thread_id: int, body: str, attachment_url: Optional[str] = None
         return _err(exc)
 
 
-# ==================================================================== Expenses
-
-def _create_expense(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    blocked = _guard_write(action)
-    if blocked:
-        return blocked
-    payload = {k: v for k, v in payload.items() if v is not None}
-    try:
-        return {"ok": True, "expense": client().post("/expenses", json=payload)}
-    except OwnerRezError as exc:
-        result = _err(exc)
-        if exc.status_code in (404, 405, 501):
-            result["hint"] = (
-                "OwnerRez may not expose a public expense-creation endpoint yet. "
-                "Run `ownerrez-mcp probe --probe-writes` to confirm."
-            )
-        return result
-    except Exception as exc:  # noqa: BLE001
-        return _err(exc)
-
-
-@mcp.tool
-def add_expense_for_booking(
-    booking_id: int,
-    amount: float,
-    description: str,
-    date: Optional[str] = None,
-    category: Optional[str] = None,
-    vendor: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Record an expense against a specific booking (e.g. a cleaning charge)."""
-    return _create_expense(
-        "add an expense",
-        {
-            "booking_id": booking_id,
-            "amount": amount,
-            "description": description,
-            "date": date or _today(),
-            "category": category,
-            "vendor": vendor,
-        },
-    )
-
-
-@mcp.tool
-def add_expense_for_property(
-    property_id: int,
-    amount: float,
-    description: str,
-    date: Optional[str] = None,
-    category: Optional[str] = None,
-    vendor: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Record an expense against a property (e.g. monthly maintenance)."""
-    return _create_expense(
-        "add an expense",
-        {
-            "property_id": property_id,
-            "amount": amount,
-            "description": description,
-            "date": date or _today(),
-            "category": category,
-            "vendor": vendor,
-        },
-    )
-
-
-@mcp.tool
-def add_expense_for_owner(
-    owner_id: int,
-    amount: float,
-    description: str,
-    property_id: Optional[int] = None,
-    date: Optional[str] = None,
-    category: Optional[str] = None,
-    vendor: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Record an expense against an owner (charged on their owner statement)."""
-    return _create_expense(
-        "add an expense",
-        {
-            "owner_id": owner_id,
-            "property_id": property_id,
-            "amount": amount,
-            "description": description,
-            "date": date or _today(),
-            "category": category,
-            "vendor": vendor,
-        },
-    )
-
-
 # ==================================================================== Webhooks
+# Subscribing to "message" events is the supported way to receive inbound guest
+# messages (there is no thread-list endpoint to poll).
 
 @mcp.tool
 def list_webhook_subscriptions(max_items: int = 200) -> Dict[str, Any]:
@@ -426,7 +397,8 @@ def create_webhook_subscription(url: str, category: str) -> Dict[str, Any]:
         url: Your HTTPS endpoint that OwnerRez will POST event payloads to.
         category: Event category (e.g. "booking", "message", "guest").
 
-    Blocked when the server is in read-only mode.
+    Subscribe to "message" to receive inbound guest messages (with their
+    threadId) for use with list_messages / send_message. Blocked in read-only mode.
     """
     blocked = _guard_write("create a webhook subscription")
     if blocked:
@@ -447,6 +419,52 @@ def delete_webhook_subscription(subscription_id: int) -> Dict[str, Any]:
     try:
         result = client().delete(f"/webhooksubscriptions/{subscription_id}")
         return {"ok": True, "deleted": subscription_id, "result": result}
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+# ============================================================ Inbox (webhooks)
+# These read the local store populated by the webhook receiver
+# (`ownerrez-mcp webhook`), giving a real "open messages" inbox. They touch
+# local state only — never the OwnerRez API — so they work in read-only mode.
+
+@mcp.tool
+def list_open_messages(limit: int = 50) -> Dict[str, Any]:
+    """List inbound guest messages captured by the webhook receiver that haven't
+    been marked handled yet — your "open messages" inbox.
+
+    Each entry includes its store id, thread_id (use with send_message), guest,
+    body, and when it arrived. Requires the webhook receiver to be running and
+    subscribed (see create_webhook_subscription with category "message").
+    """
+    try:
+        rows = store().list_open(limit=limit)
+        return {"ok": True, "count": len(rows), "open_messages": rows}
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool
+def get_message_event(event_id: int) -> Dict[str, Any]:
+    """Get one stored message event (including its raw webhook payload) by id."""
+    try:
+        row = store().get(event_id)
+        if row is None:
+            return {"ok": False, "error": f"No stored message event with id {event_id}"}
+        return {"ok": True, "event": row}
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool
+def mark_message_handled(event_id: int, handled: bool = True) -> Dict[str, Any]:
+    """Mark a stored message as handled (or reopen it), removing it from the
+    open list. Local bookkeeping only — does not call OwnerRez."""
+    try:
+        ok = store().mark_handled(event_id, handled=handled)
+        if not ok:
+            return {"ok": False, "error": f"No stored message event with id {event_id}"}
+        return {"ok": True, "event_id": event_id, "handled": handled}
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
 

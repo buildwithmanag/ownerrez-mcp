@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 DEFAULT_BASE_URL = "https://api.ownerrez.com/v2"
+DEFAULT_STORE_PATH = os.path.join(
+    os.path.expanduser("~"), ".ownerrez-mcp", "messages.db"
+)
 # OAuth endpoints. These defaults follow OwnerRez's documented OAuth app flow;
 # override via env if OwnerRez changes them.
 DEFAULT_AUTHORIZE_URL = "https://app.ownerrez.com/oauth/authorize"
@@ -47,6 +50,12 @@ class Settings:
     max_retries: int = 3
     timeout: float = 30.0
 
+    # Webhook receiver + local message store.
+    store_path: str = DEFAULT_STORE_PATH
+    webhook_host: str = "0.0.0.0"
+    webhook_port: int = 8000
+    webhook_secret: Optional[str] = None
+
     # OAuth app (used only by the `auth` helper).
     client_id: Optional[str] = None
     client_secret: Optional[str] = None
@@ -64,6 +73,10 @@ class Settings:
             read_only=_as_bool(os.getenv("OWNERREZ_READ_ONLY"), False),
             max_retries=_as_int(os.getenv("OWNERREZ_MAX_RETRIES"), 3),
             timeout=_as_float(os.getenv("OWNERREZ_TIMEOUT"), 30.0),
+            store_path=os.getenv("OWNERREZ_STORE") or DEFAULT_STORE_PATH,
+            webhook_host=os.getenv("OWNERREZ_WEBHOOK_HOST") or "0.0.0.0",
+            webhook_port=_as_int(os.getenv("OWNERREZ_WEBHOOK_PORT"), 8000),
+            webhook_secret=os.getenv("OWNERREZ_WEBHOOK_SECRET") or None,
             client_id=os.getenv("OWNERREZ_CLIENT_ID") or None,
             client_secret=os.getenv("OWNERREZ_CLIENT_SECRET") or None,
             redirect_uri=os.getenv("OWNERREZ_REDIRECT_URI") or DEFAULT_REDIRECT_URI,
@@ -76,4 +89,8 @@ class Settings:
 
     def secrets(self) -> List[str]:
         """Secret values that must never appear in logs or error output."""
-        return [s for s in (self.access_token, self.token, self.client_secret) if s]
+        return [
+            s
+            for s in (self.access_token, self.token, self.client_secret, self.webhook_secret)
+            if s
+        ]

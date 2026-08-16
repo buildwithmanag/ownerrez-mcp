@@ -18,10 +18,11 @@ ownerrez-mcp — Model Context Protocol server for OwnerRez
 usage: ownerrez-mcp [command] [options]
 
 commands:
-  serve   Run the MCP server over stdio (default if omitted).
-  auth    Run the OAuth authorization flow and print an access token.
-  probe   Probe the live API to confirm available endpoints.
-          (see: ownerrez-mcp probe --help)
+  serve     Run the MCP server over stdio (default if omitted).
+  auth      Run the OAuth authorization flow and print an access token.
+  probe     Probe the live API to confirm available endpoints.
+            (see: ownerrez-mcp probe --help)
+  webhook   Run the inbound-message webhook receiver (needs the [webhook] extra).
 
 options:
   --version   Show version and exit.
@@ -41,7 +42,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     command = "serve"
     rest: List[str] = argv
-    if argv and argv[0] in {"serve", "auth", "probe"}:
+    if argv and argv[0] in {"serve", "auth", "probe", "webhook"}:
         command, rest = argv[0], argv[1:]
 
     if command == "serve":
@@ -57,6 +58,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         from .probe import main as probe_main
 
         return probe_main(rest)
+    if command == "webhook":
+        from .webhook import run as run_webhook
+
+        return run_webhook()
 
     print(_HELP)
     return 1
