@@ -633,7 +633,7 @@ pytest -v
 ```
 
 - [ ] `ruff check .` reports no errors.
-- [ ] `pytest` passes all tests (currently 11 tests across 4 files).
+- [ ] `pytest` passes all tests (currently 17 tests across 4 files).
 
 ### 9.4 API probe (live, read-only, safe)
 
@@ -794,24 +794,87 @@ Triggered by pushing a tag matching `v*` (e.g., `v0.3.0`).
 
 ---
 
-## 11. Known OwnerRez API Limitations
+## 11. Known OwnerRez API Limitations & Findings
 
-These were discovered through live API testing and are baked into the server design:
+These were discovered through live API testing and verified against the official
+OwnerRez v2 API docs at <https://api.ownerrez.com/help/v2>.
+
+### Confirmed limitations
 
 1. **No expense creation endpoint** — `POST /expenses` returns 404. The tools
    `add_expense_for_booking`, `_property`, and `_owner` were removed in v0.2.1.
 
 2. **No thread listing endpoint** — There is no `GET /threads` or similar. You
-   cannot enumerate all message conversations. Thread IDs (`threadId`) are learned
-   from booking data or webhook events.
+   cannot enumerate all message conversations. However, `thread_ids` **are
+   available on each booking** (see finding #1 below).
 
-3. **Bookings are time-bounded** — `GET /bookings` requires `since_utc` (changed-since
-   timestamp), not arrival dates. Client-side filtering is used for arrival windows.
+3. **Bookings require a filter** — `GET /v2/bookings` requires **either**
+   `property_ids` **or** `since_utc`. It will return 400 if neither is provided.
 
-4. **Guests are time-bounded** — `GET /guests` requires `created_since_utc`.
+4. **Guests require a filter** — `GET /v2/guests` requires **either** `q` (search)
+   **or** `created_since_utc`. It will return 400 if neither is provided.
 
 5. **Messaging uses camelCase** — The `threadId` field is camelCase in both
    query params and POST bodies, despite some other fields being snake_case.
+
+6. **Messages require threadId** — `GET /v2/messages` requires a `threadId`
+   query parameter. There is no way to list all messages across threads.
+
+### Important findings (from official API docs, August 2026)
+
+1. **Bookings include `thread_ids`** — The `BookingViewModel` includes a
+   `thread_ids` field (array of int32). This means you can discover message thread
+   IDs from booking data **without** needing webhooks. The current code comments
+   and docs say webhooks are the only way — this should be corrected in future work.
+
+2. **Bookings support server-side `from`/`to` date filtering** — The API accepts:
+   - `from` — Filter for bookings that **depart on or after** a specific date
+     (in property timezone).
+   - `to` — Filter for bookings that **arrive on or before** a specific date
+     (in property timezone).
+
+   The current `list_bookings` tool does client-side `arrival_start`/`arrival_end`
+   filtering. Using server-side `from`/`to` would be more efficient and reduce
+   data transfer. **Future optimization opportunity.**
+
+3. **Additional `include_*` params for bookings** — The API supports:
+   - `include_door_codes` — Include door codes on results.
+   - `include_tags` — Include tags on results.
+   - `include_fields` — Include custom fields on results.
+   - `include_cancellation_policy` — Include cancellation policy.
+   - `include_agreements` — Include booking agreements.
+
+4. **Guest model is richer than currently used** — Includes `addresses`,
+   `email_addresses`, `phones`, `is_banned`, `notes`, opt-out flags.
+
+### Full list of available v2 endpoints (for future tools)
+
+| Resource | Available Operations |
+|----------|---------------------|
+| Bookings | GET list, POST create, GET by id, PATCH update |
+| Deposits | GET list, GET by id |
+| Discounts | GET list, POST create, GET by id, PATCH update, DELETE |
+| Fees | GET list, GET by id |
+| FieldDefinitions | GET list, POST create, GET by id, PATCH update, DELETE |
+| Fields | GET list, POST create, GET by id, PATCH update, DELETE |
+| Guests | GET list, POST create, GET by id, PATCH update, DELETE (+ sub-resources) |
+| Inquiries | GET list, GET by id |
+| ListingSites | GET list, GET by id |
+| Listings | GET list, GET by id |
+| Messages | GET list (by threadId), POST create, GET by id |
+| Owners | GET list, GET by id |
+| Payments | GET list, GET by id |
+| Properties | GET list, GET by id |
+| PropertySearch | GET search |
+| Quotes | GET list, POST create, GET by id, PATCH update, DELETE |
+| Refunds | GET list, GET by id |
+| Reviews | GET list, GET by id |
+| SpotRates | PATCH (create/update multiple) |
+| Surcharges | GET list, POST create, GET by id, PATCH update, DELETE |
+| TagDefinitions | GET list, POST create, GET by id, PATCH update, DELETE |
+| Tags | GET list, POST create, GET by id, DELETE |
+| Users | GET /users/me |
+| WebhookSubscriptions | GET list, POST create, GET by id, DELETE, GET categories |
 
 ---
 
